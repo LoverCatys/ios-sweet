@@ -1,0 +1,370 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,7 +112,8 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_vblk.c			standard
+ bsd/dev/sweet_vinput.c			standard
++bsd/dev/sweet_vgpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_vblk.c
++++ b/bsd/dev/sweet_vblk.c
+@@ -27,6 +27,7 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern void sweet_vinput_init(void);
++extern void sweet_vgpu_init(void);
+ 
+ #define VMMIO_BASE              0x0a000000ull
+ #define VMMIO_STRIDE            0x200u
+@@ -405,6 +406,7 @@
+ 	    (vb.nsectors * SECTOR_SIZE) >> 20, vb.nsectors,
+ 	    vb.writable ? "read-write" : "read-only");
+ 	sweet_vinput_init();
++	sweet_vgpu_init();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_vgpu.c
+@@ -0,0 +1,338 @@
++/*
++ * SWEET QEMU virtio-mmio (v2) console pipe (/dev/sweetgpu) for host GPU RPC.
++ *
++ * Scans QEMU virt's virtio-mmio slots (0x0a000000..0x0a003e00) for a modern
++ * virtio-console device (Magic=0x74726976, Version=2, DeviceID=3) and exposes
++ * port 0 (RX queue 0, TX queue 1) as /dev/sweetgpu (mode 0666).
++ * Used by sweetgl.dylib in backboardd to stream GLES 3.0 commands and
++ * IOSurface textures directly to the Windows host GPU over localhost TCP.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <libkern/libkern.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++void sweet_vgpu_init(void);
++
++#define VMMIO_BASE              0x0a000000ull
++#define VMMIO_STRIDE            0x200u
++#define VMMIO_SLOTS             32u
++#define VMMIO_SIZE              (VMMIO_SLOTS * VMMIO_STRIDE)
++
++#define VMMIO_MAGIC             0x000u
++#define VMMIO_VERSION           0x004u
++#define VMMIO_DEVICE_ID         0x008u
++#define VMMIO_DRV_FEATURES      0x020u
++#define VMMIO_DRV_FEATURES_SEL  0x024u
++#define VMMIO_QUEUE_SEL         0x030u
++#define VMMIO_QUEUE_NUM_MAX     0x034u
++#define VMMIO_QUEUE_NUM         0x038u
++#define VMMIO_QUEUE_READY       0x044u
++#define VMMIO_QUEUE_NOTIFY      0x050u
++#define VMMIO_INT_STATUS        0x060u
++#define VMMIO_INT_ACK           0x064u
++#define VMMIO_STATUS            0x070u
++#define VMMIO_QUEUE_DESC_LOW    0x080u
++#define VMMIO_QUEUE_DESC_HIGH   0x084u
++#define VMMIO_QUEUE_DRV_LOW     0x090u
++#define VMMIO_QUEUE_DRV_HIGH    0x094u
++#define VMMIO_QUEUE_DEV_LOW     0x0a0u
++#define VMMIO_QUEUE_DEV_HIGH    0x0a4u
++
++#define VIRTIO_MAGIC_VAL        0x74726976u
++#define VIRTIO_DEV_CONSOLE      3u
++
++#define STATUS_ACK              1u
++#define STATUS_DRIVER           2u
++#define STATUS_DRIVER_OK        4u
++#define STATUS_FEATURES_OK      8u
++
++#define VIRTQ_DESC_F_WRITE      2u
++#define QSIZE                   8u
++#define BUF_SIZE                (256u << 10)
++
++#define DMA_RX_DESC             0x0000u
++#define DMA_RX_AVAIL            0x1000u
++#define DMA_RX_USED             0x2000u
++#define DMA_TX_DESC             0x3000u
++#define DMA_TX_AVAIL            0x4000u
++#define DMA_TX_USED             0x5000u
++#define DMA_RX_BUF              0x8000u
++#define DMA_TX_BUF              (DMA_RX_BUF + BUF_SIZE)
++#define DMA_SIZE                (DMA_TX_BUF + BUF_SIZE)
++
++struct vg_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags;
++	uint16_t next;
++};
++
++struct vg_avail {
++	uint16_t flags;
++	uint16_t idx;
++	uint16_t ring[QSIZE];
++	uint16_t used_event;
++};
++
++struct vg_used_elem {
++	uint32_t id;
++	uint32_t len;
++};
++
++struct vg_used {
++	uint16_t flags;
++	uint16_t idx;
++	struct vg_used_elem ring[QSIZE];
++	uint16_t avail_event;
++};
++
++static struct {
++	vm_offset_t regs;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	uint16_t rx_last_used;
++	uint16_t tx_last_used;
++	int cmajor;
++	bool ready;
++} vg;
++
++static LCK_GRP_DECLARE(sweet_vgpu_grp, "sweet_vgpu");
++static LCK_MTX_DECLARE(sweet_vgpu_rx_lock, &sweet_vgpu_grp);
++static LCK_MTX_DECLARE(sweet_vgpu_tx_lock, &sweet_vgpu_grp);
++static int vgpu_rx_chan;
++
++static inline uint32_t
++vg_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(vg.regs + off);
++}
++
++static inline void
++vg_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(vg.regs + off) = v;
++}
++
++static int
++vg_setup_queue(uint32_t qidx, uint32_t desc_off, uint32_t avail_off, uint32_t used_off)
++{
++	vg_wr(VMMIO_QUEUE_SEL, qidx);
++	uint32_t qmax = vg_rd(VMMIO_QUEUE_NUM_MAX);
++	if (qmax < QSIZE) {
++		return EIO;
++	}
++	vg_wr(VMMIO_QUEUE_NUM, QSIZE);
++	uint64_t dpa = vg.dma_pa + desc_off;
++	uint64_t apa = vg.dma_pa + avail_off;
++	uint64_t upa = vg.dma_pa + used_off;
++	vg_wr(VMMIO_QUEUE_DESC_LOW, (uint32_t)dpa);
++	vg_wr(VMMIO_QUEUE_DESC_HIGH, (uint32_t)(dpa >> 32));
++	vg_wr(VMMIO_QUEUE_DRV_LOW, (uint32_t)apa);
++	vg_wr(VMMIO_QUEUE_DRV_HIGH, (uint32_t)(apa >> 32));
++	vg_wr(VMMIO_QUEUE_DEV_LOW, (uint32_t)upa);
++	vg_wr(VMMIO_QUEUE_DEV_HIGH, (uint32_t)(upa >> 32));
++	vg_wr(VMMIO_QUEUE_READY, 1);
++	return 0;
++}
++
++static int
++sweet_vgpu_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return vg.ready ? 0 : ENXIO;
++}
++
++static int
++sweet_vgpu_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++sweet_vgpu_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!vg.ready) {
++		return ENXIO;
++	}
++	user_ssize_t resid = uio_resid(uio);
++	if (resid <= 0) {
++		return 0;
++	}
++	uint32_t want = (uint32_t)MIN((uint64_t)resid, (uint64_t)BUF_SIZE);
++
++	lck_mtx_lock(&sweet_vgpu_rx_lock);
++	volatile struct vg_desc *desc = (volatile struct vg_desc *)(vg.dma + DMA_RX_DESC);
++	volatile struct vg_avail *avail = (volatile struct vg_avail *)(vg.dma + DMA_RX_AVAIL);
++	volatile struct vg_used *used = (volatile struct vg_used *)(vg.dma + DMA_RX_USED);
++
++	desc[0].addr = vg.dma_pa + DMA_RX_BUF;
++	desc[0].len = want;
++	desc[0].flags = VIRTQ_DESC_F_WRITE;
++	desc[0].next = 0;
++
++	uint16_t aidx = avail->idx;
++	avail->ring[aidx % QSIZE] = 0;
++	__builtin_arm_dsb(0xf);
++	avail->idx = (uint16_t)(aidx + 1);
++	__builtin_arm_dsb(0xf);
++	vg_wr(VMMIO_QUEUE_NOTIFY, 0);
++
++	while (used->idx == vg.rx_last_used) {
++		__builtin_arm_dsb(0xf);
++		(void)tsleep(&vgpu_rx_chan, PZERO, "vgpurx", 1);
++	}
++	uint32_t got = used->ring[vg.rx_last_used % QSIZE].len;
++	vg.rx_last_used = used->idx;
++	uint32_t isr = vg_rd(VMMIO_INT_STATUS);
++	if (isr) {
++		vg_wr(VMMIO_INT_ACK, isr);
++	}
++	__builtin_arm_dsb(0xf);
++	if (got > want) {
++		got = want;
++	}
++	int err = uiomove((caddr_t)(vg.dma + DMA_RX_BUF), (int)got, uio);
++	lck_mtx_unlock(&sweet_vgpu_rx_lock);
++	return err;
++}
++
++static int
++sweet_vgpu_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!vg.ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_vgpu_tx_lock);
++	volatile struct vg_desc *desc = (volatile struct vg_desc *)(vg.dma + DMA_TX_DESC);
++	volatile struct vg_avail *avail = (volatile struct vg_avail *)(vg.dma + DMA_TX_AVAIL);
++	volatile struct vg_used *used = (volatile struct vg_used *)(vg.dma + DMA_TX_USED);
++
++	int err = 0;
++	while (uio_resid(uio) > 0) {
++		uint32_t chunk = (uint32_t)MIN((uint64_t)uio_resid(uio), (uint64_t)BUF_SIZE);
++		err = uiomove((caddr_t)(vg.dma + DMA_TX_BUF), (int)chunk, uio);
++		if (err) {
++			break;
++		}
++		desc[0].addr = vg.dma_pa + DMA_TX_BUF;
++		desc[0].len = chunk;
++		desc[0].flags = 0;
++		desc[0].next = 0;
++
++		uint16_t aidx = avail->idx;
++		avail->ring[aidx % QSIZE] = 0;
++		__builtin_arm_dsb(0xf);
++		avail->idx = (uint16_t)(aidx + 1);
++		__builtin_arm_dsb(0xf);
++		vg_wr(VMMIO_QUEUE_NOTIFY, 1);
++
++		while (used->idx == vg.tx_last_used) {
++			__builtin_arm_dsb(0xf);
++		}
++		vg.tx_last_used = used->idx;
++		uint32_t isr = vg_rd(VMMIO_INT_STATUS);
++		if (isr) {
++			vg_wr(VMMIO_INT_ACK, isr);
++		}
++	}
++	lck_mtx_unlock(&sweet_vgpu_tx_lock);
++	return err;
++}
++
++static const struct cdevsw sweet_vgpu_cdevsw = {
++	.d_open       = sweet_vgpu_open,
++	.d_close      = sweet_vgpu_close,
++	.d_read       = sweet_vgpu_read,
++	.d_write      = sweet_vgpu_write,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_TTY,
++};
++
++void
++sweet_vgpu_init(void)
++{
++	if (vg.ready) {
++		return;
++	}
++	vm_offset_t base = ml_io_map(VMMIO_BASE, VMMIO_SIZE);
++	if (!base) {
++		return;
++	}
++	bool found = false;
++	for (uint32_t slot = 0; slot < VMMIO_SLOTS; slot++) {
++		vm_offset_t r = base + slot * VMMIO_STRIDE;
++		uint32_t magic = *(volatile uint32_t *)(r + VMMIO_MAGIC);
++		uint32_t ver = *(volatile uint32_t *)(r + VMMIO_VERSION);
++		uint32_t devid = *(volatile uint32_t *)(r + VMMIO_DEVICE_ID);
++		if (magic == VIRTIO_MAGIC_VAL && ver == 2 && devid == VIRTIO_DEV_CONSOLE) {
++			vg.regs = r;
++			found = true;
++			printf("SWEET VGPU: found virtio-console v2 at slot %u (0x%llx)\n",
++			    slot, VMMIO_BASE + slot * VMMIO_STRIDE);
++			break;
++		}
++	}
++	if (!found) {
++		printf("SWEET VGPU: no virtio-console device (host GPU disabled)\n");
++		return;
++	}
++	if (kmem_alloc_contig(kernel_map, &vg.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)vg.dma);
++	if (!pn) {
++		return;
++	}
++	vg.dma_pa = ptoa_64(pn);
++
++	vg_wr(VMMIO_STATUS, 0);
++	__builtin_arm_dsb(0xf);
++	vg_wr(VMMIO_STATUS, STATUS_ACK);
++	vg_wr(VMMIO_STATUS, STATUS_ACK | STATUS_DRIVER);
++	vg_wr(VMMIO_DRV_FEATURES_SEL, 0);
++	vg_wr(VMMIO_DRV_FEATURES, 0);
++	vg_wr(VMMIO_DRV_FEATURES_SEL, 1);
++	vg_wr(VMMIO_DRV_FEATURES, 1u); /* VIRTIO_F_VERSION_1 */
++	vg_wr(VMMIO_STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK);
++	if (!(vg_rd(VMMIO_STATUS) & STATUS_FEATURES_OK)) {
++		printf("SWEET VGPU: device rejected features\n");
++		return;
++	}
++	if (vg_setup_queue(0, DMA_RX_DESC, DMA_RX_AVAIL, DMA_RX_USED) ||
++	    vg_setup_queue(1, DMA_TX_DESC, DMA_TX_AVAIL, DMA_TX_USED)) {
++		printf("SWEET VGPU: queue setup failed\n");
++		return;
++	}
++	__builtin_arm_dsb(0xf);
++	vg_wr(VMMIO_STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
++
++	vg.cmajor = cdevsw_add(-1, &sweet_vgpu_cdevsw);
++	if (vg.cmajor < 0) {
++		return;
++	}
++	devfs_make_node(makedev(vg.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweetgpu");
++	vg.ready = true;
++	printf("SWEET VGPU: /dev/sweetgpu ready (256 KiB virtio-console pipe)\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
