@@ -1,0 +1,26 @@
+name: sweetgl-pc
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sweetgl.dylib (iOS 16 arm64)
+        run: |
+          mkdir -p out
+          python3 tools/sweetgl-pc/gen_rpc_dispatch.py tools/sweetgl-pc/ref/ios-dispatch.txt out/dispatch_pc.c
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -Wno-deprecated-declarations \
+            -dynamiclib -install_name /usr/lib/sweetgl.dylib \
+            tools/sweetgl-pc/sweetgl_pc.c out/dispatch_pc.c \
+            -framework IOSurface -framework OpenGLES -framework CoreFoundation -lobjc \
+            -o out/sweetgl.dylib
+          codesign -f -s - out/sweetgl.dylib
+          ls -lh out/sweetgl.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetgl-dylib
+          path: out/sweetgl.dylib
+          retention-days: 7
