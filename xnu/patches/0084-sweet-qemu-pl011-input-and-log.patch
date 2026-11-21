@@ -1,0 +1,186 @@
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -267,6 +267,7 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++extern void sweet_vinput_putc(const char *c, int size); /* bsd/dev/sweet_vinput.c */
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+@@ -282,6 +283,7 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
++	sweet_vinput_putc(c, size);
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -533,6 +533,11 @@
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
++			int nooff = 0;
++			if (off && PE_parse_boot_argn("sweetfb_nooff", &nooff, sizeof(nooff)) && nooff != 0) {
++				IOLog("SWEET FB: display off suppressed (sweetfb_nooff=1)\n");
++				break;
++			}
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+--- a/bsd/dev/sweet_vinput.c
++++ b/bsd/dev/sweet_vinput.c
+@@ -1,10 +1,11 @@
+ /*
+- * SWEET QEMU shared-memory touch & button input bridge.
++ * SWEET QEMU PL011 UART (0x09000000) touch/button input & live console bridge.
+  *
+- * Maps a 4 KiB ring buffer at physical 0x9d700000 (immediately after the
+- * framebuffer at 0x9c000000 + 0x1700000). The host QEMU viewer writes touch
+- * and button events directly into shared guest RAM; this thread forwards them
+- * to SweetHID (sweet_hid_touch / sweet_hid_key).
++ * TX: mirrors all XNU/SpringBoard/CRASH console output to QEMU's PL011 UART so
++ *     the host sees live logs even with sweetfb_noconsole=1.
++ * RX: receives compact framed touch & key packets over -serial tcp:... :
++ *     [0xAA, 'T', finger, down, x_lo, x_hi, y_lo, y_hi] -> sweet_hid_touch()
++ *     [0xAA, 'K', key, down]                            -> sweet_hid_key()
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -18,72 +19,97 @@
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ extern void sweet_hid_key(int key, int down);
+ void sweet_vinput_init(void);
++void sweet_vinput_putc(const char *c, int size);
+ 
+-#define VINPUT_PA       0x9d700000ull
+-#define VINPUT_MAGIC    0x56494E50u /* "VINP" */
+-#define VINPUT_RING_SZ  64u
++#define PL011_PA        0x09000000ull
++#define PL011_DR        0x00u
++#define PL011_FR        0x18u
++#define PL011_FR_RXFE   (1u << 4)
+ 
+-struct sweet_vinput_ev {
+-	uint32_t type; /* 1 = touch (finger, down, x, y), 2 = key (key, down) */
+-	int32_t a;
+-	int32_t b;
+-	int32_t c;
+-	int32_t d;
+-};
+-
+-struct sweet_vinput_ring {
+-	uint32_t magic;
+-	uint32_t wr_idx;
+-	uint32_t rd_idx;
+-	uint32_t pad;
+-	struct sweet_vinput_ev ev[VINPUT_RING_SZ];
+-};
+-
+-static volatile struct sweet_vinput_ring *vinput_ring;
++static volatile uint32_t *pl011_base;
+ static int vinput_chan;
+ static bool vinput_started;
+ 
++void
++sweet_vinput_putc(const char *c, int size)
++{
++	volatile uint32_t *base = pl011_base;
++	if (!base || !c || size <= 0) {
++		return;
++	}
++	for (int i = 0; i < size; i++) {
++		base[PL011_DR / 4] = (uint8_t)c[i];
++	}
++}
++
+ static void
+ sweet_vinput_thread(__unused void *arg, __unused wait_result_t wr)
+ {
++	uint8_t state = 0; /* 0=sync, 1=cmd, 2=payload */
++	uint8_t cmd = 0;
++	uint8_t need = 0;
++	uint8_t got = 0;
++	uint8_t pkt[8];
++
+ 	for (;;) {
+-		if (vinput_ring && vinput_ring->magic == VINPUT_MAGIC) {
+-			uint32_t rd = vinput_ring->rd_idx;
+-			uint32_t wr_i = vinput_ring->wr_idx;
+-			__builtin_arm_dmb(0xf);
+-			while (rd != wr_i) {
+-				struct sweet_vinput_ev ev = vinput_ring->ev[rd % VINPUT_RING_SZ];
+-				rd++;
+-				if (ev.type == 1) {
+-					sweet_hid_touch(ev.a, ev.b, ev.c, ev.d);
+-				} else if (ev.type == 2) {
+-					sweet_hid_key(ev.a, ev.b);
++		volatile uint32_t *base = pl011_base;
++		if (base) {
++			while ((base[PL011_FR / 4] & PL011_FR_RXFE) == 0) {
++				uint8_t b = (uint8_t)(base[PL011_DR / 4] & 0xffu);
++				if (state == 0) {
++					if (b == 0xAAu) {
++						state = 1;
++					}
++				} else if (state == 1) {
++					if (b == 'T') {
++						cmd = 'T';
++						need = 6;
++						got = 0;
++						state = 2;
++					} else if (b == 'K') {
++						cmd = 'K';
++						need = 2;
++						got = 0;
++						state = 2;
++					} else {
++						state = (b == 0xAAu) ? 1 : 0;
++					}
++				} else {
++					pkt[got++] = b;
++					if (got == need) {
++						if (cmd == 'T') {
++							int x = (int)((uint16_t)pkt[2] | ((uint16_t)pkt[3] << 8));
++							int y = (int)((uint16_t)pkt[4] | ((uint16_t)pkt[5] << 8));
++							sweet_hid_touch((int)pkt[0], (int)pkt[1], x, y);
++						} else if (cmd == 'K') {
++							sweet_hid_key((int)pkt[0], (int)pkt[1]);
++						}
++						state = 0;
++					}
+ 				}
+ 			}
+-			__builtin_arm_dmb(0xf);
+-			vinput_ring->rd_idx = rd;
+ 		}
+ 		(void)tsleep(&vinput_chan, PZERO, "vinput", 1);
+ 	}
+ }
+ 
+ void
+ sweet_vinput_init(void)
+ {
+ 	if (vinput_started) {
+ 		return;
+ 	}
+-	vm_offset_t va = ml_io_map(VINPUT_PA, 4096);
++	vm_offset_t va = ml_io_map(PL011_PA, 4096);
+ 	if (!va) {
+-		printf("SWEET VINPUT: failed to map 0x%llx\n", VINPUT_PA);
++		printf("SWEET VINPUT: failed to map PL011 at 0x%llx\n", PL011_PA);
+ 		return;
+ 	}
+-	vinput_ring = (volatile struct sweet_vinput_ring *)va;
++	pl011_base = (volatile uint32_t *)va;
+ 	thread_t th;
+ 	if (kernel_thread_start(sweet_vinput_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+ 		vinput_started = true;
+-		printf("SWEET VINPUT: shared-memory touch/key bridge ready at 0x%llx\n", VINPUT_PA);
++		printf("SWEET VINPUT: PL011 touch/key + live log bridge ready at 0x%llx\n", PL011_PA);
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
